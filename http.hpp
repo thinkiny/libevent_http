@@ -112,6 +112,8 @@ public:
         event_del(notify_ev_);
         if(bg_.joinable()) {
             bg_.join();
+        } else {
+            event_base_loop(base_, 0);
         }
     }
 
