@@ -43,7 +43,7 @@ public:
     }
 
 private:
-    std::unique_ptr<T, decltype(Free)> handle_;
+    std::shared_ptr<T> handle_;
 };
 
 const char* evhttp_err2str(evhttp_request_error error) {
@@ -73,14 +73,15 @@ using Event = Handle<event, event_free>;
 }
 
 class EventLoop {
-    EventLoop(const EventLoop&);
-    EventLoop& operator=(const EventLoop&);
-    EventLoop(EventLoop&&);
 public:
     static std::shared_ptr<EventLoop> New() {
         return std::make_shared<EventLoop>();
     }
 
+    EventLoop(const EventLoop&) = delete;
+    EventLoop& operator=(const EventLoop&) = delete;
+    EventLoop(EventLoop&&) = delete;
+    EventLoop& operator=(EventLoop&&) = delete;
     EventLoop() {
         evthread_use_pthreads();
         base_ = event_base_new();
@@ -90,10 +91,7 @@ public:
     }
 
     ~EventLoop() {
-        event_del(notify_ev_);
-        if(bg_.joinable()) {
-            bg_.join();
-        }
+        Wait();
         close(notify_fd_);
     }
 
@@ -110,8 +108,19 @@ public:
         event_base_loop(base_, 0);
     }
 
-    void Stop() {
-        event_base_loopexit(base_, nullptr);
+    void Wait() {
+        event_del(notify_ev_);
+        if(bg_.joinable()) {
+            bg_.join();
+        }
+    }
+
+    void Stop(bool force = false) {
+        if(force) {
+            event_base_loopexit(base_, NULL);
+        } else {
+            Wait();
+        }
     }
 
     void RunInBackground() {
@@ -123,7 +132,6 @@ private:
         uint64_t dummy;
         dummy = read(fd, &dummy, sizeof(dummy));
     }
-
 private:
     int notify_fd_ = -1;
     internal::Event notify_ev_;
@@ -132,12 +140,13 @@ private:
 };
 
 class Response {
-    Response(const Response&);
-    Response& operator=(const Response&);
 public:
+    Response(const Response&) = delete;
+    Response& operator=(const Response&) = delete;
+
     struct BodySlice {
         char *content;
-        size_t len;
+        size_t length;
 
         char& operator[](int n) {
             return content[n];
@@ -181,26 +190,16 @@ private:
 };
 
 class Get {
-    static void GetError(evhttp_request_error error, void *arg) {
-        Get *get_req = (Get*)arg;
-        get_req->error_func_(internal::evhttp_err2str(error));
-        get_req->has_error_ = true;
-    }
-
-    static void GetComplete(evhttp_request *req, void *arg) {
-        Get *get_req = (Get*)arg;
-        if(!get_req->has_error_) {
-            get_req->finish_func_(Response(req));
-        }
-    }
+    struct ExecuteContext;
 public:
     typedef std::function<void(Response&&)> FinishFunc;
     typedef std::function<void(const char*)> ErrorFunc;
-
+public:
     Get(const Get&) = delete;
     Get& operator=(const Get&) = delete;
     Get(Get&&) = default;
-
+    Get(const std::string& url) : Get(url.c_str()) {}
+    Get(const std::string& url, std::shared_ptr<EventLoop>& loop) : Get(url.c_str(), loop) {}
     Get(const char *url) {
         loop_ = std::make_shared<EventLoop>();
         loop_->RunInBackground();
@@ -244,37 +243,17 @@ public:
 
     template <typename T>
     void Execute(T&& finish_func) {
-        std::string path_query;
-        auto *req = evhttp_request_new(&GetComplete, this);
-        auto *path = evhttp_uri_get_path(uri_);
-        auto *query = evhttp_uri_get_query(uri_);
-        path_query += path[0] != '\0' ? path : "/";
-        if(query && query[0] != '\0') {
-            path_query += "?";
-            path_query += query;
-        }
-
-        if(error_func_) {
-            evhttp_request_set_error_cb(req, GetError);
-        }
-
-        has_error_ = false;
-        finish_func_ = std::forward<T>(finish_func);
-        for(auto& header : headers_) {
-            evhttp_add_header(req->output_headers, header.first.c_str(), header.second.c_str());
-        }
-
-        evhttp_add_header(req->output_headers, "Host", evhttp_uri_get_host(uri_));
-        if(evhttp_make_request(conn_, req, EVHTTP_REQ_GET,  path_query.c_str()) < 0) {
-            throw std::runtime_error(strerror(errno));
-        }
-        loop_->Interrupt();
+        auto *context = new ExecuteContext;
+        context->finish_func = std::forward<T>(finish_func);
+        Execute(context);
     }
 
     template <typename T, typename U>
     void Execute(T&& finish_func, U&& error_func) {
-        error_func_ = std::forward<U>(error_func);
-        Execute(std::forward<T>(finish_func));
+        auto *context = new ExecuteContext;
+        context->finish_func = std::forward<T>(finish_func);
+        context->error_func = std::forward<U>(error_func);
+        Execute(context);
     }
 
     Response Execute() {
@@ -314,14 +293,64 @@ private:
         }
     }
 
+    void Execute(ExecuteContext *context) {
+        std::string path_query;
+        auto *req = evhttp_request_new(&GetComplete, context);
+        auto *path = evhttp_uri_get_path(uri_);
+        auto *query = evhttp_uri_get_query(uri_);
+        path_query += path[0] != '\0' ? path : "/";
+        if(query && query[0] != '\0') {
+            path_query += "?";
+            path_query += query;
+        }
+
+        if(context->error_func) {
+            evhttp_request_set_error_cb(req, GetError);
+        }
+
+        for(auto& header : headers_) {
+            evhttp_add_header(req->output_headers, header.first.c_str(), header.second.c_str());
+        }
+
+        evhttp_add_header(req->output_headers, "Host", evhttp_uri_get_host(uri_));
+        context->uri = uri_;
+        context->conn = conn_;
+        context->loop = loop_;
+        if(evhttp_make_request(conn_, req, EVHTTP_REQ_GET,  path_query.c_str()) < 0) {
+            delete context;
+            throw std::runtime_error(strerror(errno));
+        }
+        loop_->Interrupt();
+    }
 private:
-    bool has_error_;
-    FinishFunc finish_func_;
-    ErrorFunc error_func_;
-    std::unordered_map<std::string, std::string> headers_;
+    struct ExecuteContext{
+        bool has_error = false;
+        Get::FinishFunc finish_func;
+        Get::ErrorFunc error_func;
+        internal::EvHttpUri uri;
+        internal::EvHttpConnection conn;
+        std::shared_ptr<EventLoop> loop;
+    };
+
+    static void GetError(evhttp_request_error error, void *arg) {
+        ExecuteContext *context = static_cast<ExecuteContext*>(arg);
+        context->error_func(internal::evhttp_err2str(error));
+        context->has_error = true;
+    }
+
+    static void GetComplete(evhttp_request *req, void *arg) {
+        ExecuteContext *context = static_cast<ExecuteContext*>(arg);
+        if(!context->has_error) {
+            context->finish_func(Response(req));
+        }
+        delete context;
+    }
+
+private:
     internal::EvHttpUri uri_;
     internal::EvHttpConnection conn_;
     std::shared_ptr<EventLoop> loop_;
+    std::unordered_map<std::string, std::string> headers_;
 };
 
 }
