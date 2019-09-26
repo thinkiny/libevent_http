@@ -385,7 +385,13 @@ private:
     static void GetComplete(evhttp_request *req, void *arg) {
         ExecuteContext *context = static_cast<ExecuteContext*>(arg);
         if(!context->has_error) {
-            context->finish_func(Response(req));
+            if(req->response_code) {
+                context->finish_func(Response(req));
+            } else {
+                if(context->error_func) {
+                    context->error_func(internal::evhttp_err2str(EVREQ_HTTP_TIMEOUT));
+                }
+            }
         }
         delete context;
     }
