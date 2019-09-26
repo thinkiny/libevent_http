@@ -111,6 +111,10 @@ public:
     void Wait() {
         event_del(notify_ev_);
         if(bg_.joinable()) {
+            if(bg_.get_id() == std::this_thread::get_id()) {
+                bg_.detach();
+                return;
+            }
             bg_.join();
         } else {
             event_base_loop(base_, 0);
@@ -121,7 +125,7 @@ public:
         if(force) {
             event_base_loopexit(base_, NULL);
         } else {
-            Wait();
+            event_del(notify_ev_);
         }
     }
 
