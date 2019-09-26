@@ -75,7 +75,9 @@ using Event = Handle<event, event_free>;
 class EventLoop {
 public:
     static std::shared_ptr<EventLoop> New() {
-        return std::make_shared<EventLoop>();
+        auto loop = std::make_shared<EventLoop>();
+        loop->RunInBackground();
+        return loop;
     }
 
     EventLoop(const EventLoop&) = delete;
@@ -105,7 +107,11 @@ public:
     }
 
     void Run() {
-        event_base_loop(base_, 0);
+        if(!bg_.joinable()) {
+            event_base_loop(base_, 0);
+        } else {
+            bg_.join();
+        }
     }
 
     void Wait() {
@@ -130,7 +136,9 @@ public:
     }
 
     void RunInBackground() {
-        bg_ = std::thread(event_base_loop, static_cast<event_base*>(base_), 0);
+        if(!bg_.joinable()) {
+            bg_ = std::thread(event_base_loop, static_cast<event_base*>(base_), 0);
+        }
     }
 
 private:
@@ -245,6 +253,36 @@ public:
 
     Get&& AddHeader(const char *key, std::string value) && {
         return std::move(this->AddHeader(key, value));
+    }
+
+    Get& SetRetryInterval(int ms) & {
+        struct timeval tv;
+        tv.tv_sec = ms / 1000;
+        tv.tv_usec = (ms % 1000) * 1000;
+        evhttp_connection_set_initial_retry_tv(conn_, &tv);
+        return *this;
+    }
+
+    Get&& SetRetryInterval(int ms) && {
+        return std::move(this->SetRetryInterval(ms));
+    }
+
+    Get& SetMaxBodySize(ssize_t size) & {
+        evhttp_connection_set_max_body_size(conn_, size);
+        return *this;
+    }
+
+    Get&& SetMaxBodySize(ssize_t size) && {
+        return std::move(this->SetMaxBodySize(size));
+    }
+
+    Get& SetMaxHeaderSize(ssize_t size) & {
+        evhttp_connection_set_max_body_size(conn_, size);
+        return *this;
+    }
+
+    Get&& SetMaxHeaderSize(ssize_t size) && {
+        return std::move(this->SetMaxHeaderSize(size));
     }
 
     template <typename T>
