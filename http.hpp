@@ -15,6 +15,7 @@
 #include <sys/eventfd.h>
 #include <errno.h>
 #include <chrono>
+#include <type_traits>
 
 namespace http {
 
@@ -126,7 +127,7 @@ public:
 
     template <typename Duration>
     void Cron(const Duration& duration, bool repeat, const TimeoutFunc& func) {
-        static_assert(internal::is_chrono_duration<Duration>::value, "duration must be a std::chrono::duration");
+        static_assert(internal::is_chrono_duration<Duration>::value, "arg0 must be a std::chrono::duration");
         TimerEvent *event = new TimerEvent(shared_from_this(), func);
         event->Start(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count(),
                      repeat);
@@ -338,6 +339,7 @@ public:
 
     template <typename T>
     void Execute(T&& finish_func) {
+        static_assert(std::is_convertible<T, FinishFunc>::value, "arg0 must be a http::Get::FinishFunc");
         auto *context = new ExecuteContext();
         context->finish_func = std::forward<T>(finish_func);
         Execute(context);
@@ -345,6 +347,8 @@ public:
 
     template <typename T, typename U>
     void Execute(T&& finish_func, U&& error_func) {
+        static_assert(std::is_convertible<T, FinishFunc>::value, "arg0 must be a http::Get::FinishFunc");
+        static_assert(std::is_convertible<U, ErrorFunc>::value, "arg1 must be a http::Get::ErrorFunc");
         auto *context = new ExecuteContext();
         context->finish_func = std::forward<T>(finish_func);
         context->error_func = std::forward<U>(error_func);
