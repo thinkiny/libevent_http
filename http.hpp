@@ -14,10 +14,30 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <errno.h>
+#include <chrono>
 
 namespace http {
 
 namespace internal {
+
+timeval* setTimevalFromMs(timeval& tv, int64_t ms) {
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    return &tv;
+}
+
+
+template <typename T>
+struct is_chrono_duration
+{
+    static constexpr bool value = false;
+};
+
+template <typename Rep, typename Period>
+struct is_chrono_duration<std::chrono::duration<Rep, Period>>
+{
+    static constexpr bool value = true;
+};
 
 template <typename T, void(*Free)(T*)>
 class Handle {
@@ -38,7 +58,7 @@ public:
         return handle_.get();
     }
 
-    T* operator->() {
+    T* operator->() const {
         return handle_.get();
     }
 
@@ -72,10 +92,15 @@ using Event = Handle<event, event_free>;
 
 }
 
-class EventLoop {
+class EventLoop;
+typedef std::shared_ptr<EventLoop> EventLoopPtr;
+
+class EventLoop : public std::enable_shared_from_this<EventLoop> {
 public:
-    static std::shared_ptr<EventLoop> New() {
-        auto loop = std::make_shared<EventLoop>();
+    class TimerEvent;
+    typedef std::function<void(TimerEvent*)> TimeoutFunc;
+    static EventLoopPtr New() {
+        EventLoopPtr loop(new EventLoop());
         loop->RunInBackground();
         return loop;
     }
@@ -84,13 +109,6 @@ public:
     EventLoop& operator=(const EventLoop&) = delete;
     EventLoop(EventLoop&&) = delete;
     EventLoop& operator=(EventLoop&&) = delete;
-    EventLoop() {
-        evthread_use_pthreads();
-        base_ = event_base_new();
-        notify_fd_ = eventfd(0, EFD_NONBLOCK);
-        notify_ev_ = event_new(base_, notify_fd_, EV_READ | EV_PERSIST, Wakeup, nullptr);
-        event_add(notify_ev_, nullptr);
-    }
 
     ~EventLoop() {
         Wait();
@@ -104,6 +122,14 @@ public:
     void Interrupt() {
         uint64_t dummy = 1;
         dummy = write(notify_fd_, &dummy, sizeof(dummy));
+    }
+
+    template <typename Duration>
+    void Cron(const Duration& duration, bool repeat, const TimeoutFunc& func) {
+        static_assert(internal::is_chrono_duration<Duration>::value, "duration must be a std::chrono::duration");
+        TimerEvent *event = new TimerEvent(shared_from_this(), func);
+        event->Start(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count(),
+                     repeat);
     }
 
     void Run() {
@@ -141,7 +167,54 @@ public:
         }
     }
 
+    class TimerEvent {
+    public:
+        TimerEvent(EventLoopPtr loop, const TimeoutFunc& func) : loop_(loop), func_(func) {}
+
+        ~TimerEvent() {
+            Stop();
+        }
+
+        void Stop() {
+            event_del(timer_ev_);
+            repeat_ = false;
+        }
+
+        void Start(int64_t ms, bool repeat) {
+            if(!timer_ev_) {
+                timer_ev_ = event_new(loop_->GetEventBase(), -1, repeat ? EV_PERSIST : 0, &TimerEvent::Timeout, this);
+            }
+
+            timeval tv;
+            evtimer_add(timer_ev_, internal::setTimevalFromMs(tv, ms));
+            repeat_ = repeat;
+            loop_->Interrupt();
+        }
+
+    private:
+        static void Timeout(evutil_socket_t fd, short event, void *arg) {
+            TimerEvent *timer = static_cast<TimerEvent*>(arg);
+            timer->func_(timer);
+            if(!timer->repeat_) {
+                delete timer;
+            }
+        }
+
+        bool repeat_;
+        EventLoopPtr loop_;
+        internal::Event timer_ev_;
+        TimeoutFunc func_;
+    };
+
 private:
+    EventLoop() {
+        evthread_use_pthreads();
+        base_ = event_base_new();
+        notify_fd_ = eventfd(0, EFD_NONBLOCK);
+        notify_ev_ = event_new(base_, notify_fd_, EV_READ | EV_PERSIST, Wakeup, nullptr);
+        event_add(notify_ev_, nullptr);
+    }
+
     static void Wakeup(evutil_socket_t fd, short event, void *arg) {
         uint64_t dummy;
         dummy = read(fd, &dummy, sizeof(dummy));
@@ -155,9 +228,6 @@ private:
 
 class Response {
 public:
-    Response(const Response&) = delete;
-    Response& operator=(const Response&) = delete;
-
     struct BodySlice {
         char *content;
         size_t length;
@@ -167,21 +237,7 @@ public:
         }
     };
 
-    Response(evhttp_request *req) : req_(req) {
-        evhttp_request_own(req_);
-    }
-
-    Response(Response&& response) {
-        req_ = response.req_;
-        response.req_ = nullptr;
-    }
-
-    ~Response() {
-        if(req_) {
-            evhttp_request_free(req_);
-        }
-    }
-
+    Response(evhttp_request *req) : req_(req) {}
     int GetResponseCode() const {
         return req_->response_code;
     }
@@ -213,23 +269,20 @@ public:
     Get& operator=(const Get&) = delete;
     Get(Get&&) = default;
     Get(const std::string& url) : Get(url.c_str()) {}
-    Get(const std::string& url, std::shared_ptr<EventLoop>& loop) : Get(url.c_str(), loop) {}
+    Get(const std::string& url, EventLoopPtr& loop) : Get(url.c_str(), loop) {}
     Get(const char *url) {
-        loop_ = std::make_shared<EventLoop>();
-        loop_->RunInBackground();
+        loop_ = EventLoop::New();
         Init(url);
     }
 
-    Get(const char *url, std::shared_ptr<EventLoop> loop) {
+    Get(const char *url, EventLoopPtr loop) {
         loop_ = loop;
         Init(url);
     }
 
     Get& SetTimeout(int ms) & {
-        struct timeval tv;
-        tv.tv_sec = ms / 1000;
-        tv.tv_usec = (ms % 1000) * 1000;
-        evhttp_connection_set_timeout_tv(conn_, &tv);
+        timeval tv;
+        evhttp_connection_set_timeout_tv(conn_, internal::setTimevalFromMs(tv, ms));
         return *this;
     }
 
@@ -256,10 +309,8 @@ public:
     }
 
     Get& SetRetryInterval(int ms) & {
-        struct timeval tv;
-        tv.tv_sec = ms / 1000;
-        tv.tv_usec = (ms % 1000) * 1000;
-        evhttp_connection_set_initial_retry_tv(conn_, &tv);
+        timeval tv;
+        evhttp_connection_set_initial_retry_tv(conn_, internal::setTimevalFromMs(tv, ms));
         return *this;
     }
 
@@ -287,14 +338,14 @@ public:
 
     template <typename T>
     void Execute(T&& finish_func) {
-        auto *context = new ExecuteContext;
+        auto *context = new ExecuteContext();
         context->finish_func = std::forward<T>(finish_func);
         Execute(context);
     }
 
     template <typename T, typename U>
     void Execute(T&& finish_func, U&& error_func) {
-        auto *context = new ExecuteContext;
+        auto *context = new ExecuteContext();
         context->finish_func = std::forward<T>(finish_func);
         context->error_func = std::forward<U>(error_func);
         Execute(context);
@@ -357,13 +408,13 @@ private:
         }
 
         evhttp_add_header(req->output_headers, "Host", evhttp_uri_get_host(uri_));
-        context->uri = uri_;
-        context->conn = conn_;
-        context->loop = loop_;
         if(evhttp_make_request(conn_, req, EVHTTP_REQ_GET,  path_query.c_str()) < 0) {
             delete context;
             throw std::runtime_error(strerror(errno));
         }
+        context->uri = uri_;
+        context->conn = conn_;
+        context->loop = loop_;
         loop_->Interrupt();
     }
 private:
@@ -373,7 +424,7 @@ private:
         Get::ErrorFunc error_func;
         internal::EvHttpUri uri;
         internal::EvHttpConnection conn;
-        std::shared_ptr<EventLoop> loop;
+        EventLoopPtr loop;
     };
 
     static void GetError(evhttp_request_error error, void *arg) {
@@ -399,7 +450,7 @@ private:
 private:
     internal::EvHttpUri uri_;
     internal::EvHttpConnection conn_;
-    std::shared_ptr<EventLoop> loop_;
+    EventLoopPtr loop_;
     std::unordered_map<std::string, std::string> headers_;
 };
 
