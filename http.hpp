@@ -181,6 +181,21 @@ public:
             repeat_ = false;
         }
 
+        void Suspend() {
+            event_del(timer_ev_);
+        }
+
+        void Resume(int64_t ms) {
+            timeval tv;
+            evtimer_add(timer_ev_, internal::setTimevalFromMs(tv, ms));
+            loop_->Interrupt();
+        }
+
+        void Resume() {
+            evtimer_add(timer_ev_, NULL);
+            loop_->Interrupt();
+        }
+
         void Start(int64_t ms, bool repeat) {
             if(!timer_ev_) {
                 timer_ev_ = event_new(loop_->GetEventBase(), -1, repeat ? EV_PERSIST : 0, &TimerEvent::Timeout, this);
