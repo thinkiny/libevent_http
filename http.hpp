@@ -440,7 +440,7 @@ private:
     static void GetComplete(evhttp_request *req, void *arg) {
         ExecuteContext *context = static_cast<ExecuteContext*>(arg);
         if(!context->has_error) {
-            if(req->response_code) {
+            if(req && req->response_code) {
                 context->finish_func(Response(req));
             } else {
                 if(context->error_func) {
