@@ -27,16 +27,18 @@ timeval* setTimevalFromMs(timeval& tv, int64_t ms) {
     return &tv;
 }
 
+template <typename Duration>
+timeval* setTimevalFromDuration(timeval& tv, const Duration d) {
+    return setTimevalFromMs(tv, std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
+}
 
 template <typename T>
-struct is_chrono_duration
-{
+struct is_chrono_duration {
     static constexpr bool value = false;
 };
 
 template <typename Rep, typename Period>
-struct is_chrono_duration<std::chrono::duration<Rep, Period>>
-{
+struct is_chrono_duration<std::chrono::duration<Rep, Period>> {
     static constexpr bool value = true;
 };
 
@@ -48,7 +50,7 @@ class Handle {
         }
     }
 public:
-    Handle(T *t) : handle_(t, SafeFree){}
+    Handle(T *t) : handle_(t, SafeFree) {}
     Handle() : handle_(nullptr, SafeFree) {}
 
     operator bool() {
@@ -98,8 +100,8 @@ typedef std::shared_ptr<EventLoop> EventLoopPtr;
 
 class EventLoop : public std::enable_shared_from_this<EventLoop> {
 public:
-    class TimerEvent;
-    typedef std::function<void(TimerEvent*)> TimeoutFunc;
+    class Timer;
+    typedef std::function<void(Timer*)> TimeoutFunc;
     static EventLoopPtr New() {
         EventLoopPtr loop(new EventLoop());
         loop->RunInBackground();
@@ -112,7 +114,9 @@ public:
     EventLoop& operator=(EventLoop&&) = delete;
 
     ~EventLoop() {
-        Wait();
+        Stop();
+        WaitBackground();
+        event_del(notify_ev_);
         close(notify_fd_);
     }
 
@@ -128,38 +132,19 @@ public:
     template <typename Duration>
     void Cron(const Duration& duration, bool repeat, const TimeoutFunc& func) {
         static_assert(internal::is_chrono_duration<Duration>::value, "arg0 must be a std::chrono::duration");
-        TimerEvent *event = new TimerEvent(shared_from_this(), func);
-        event->Start(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count(),
-                     repeat);
+        auto *timer = new Timer(shared_from_this(), func);
+        timer->Start(duration, repeat);
     }
 
     void Run() {
-        if(!bg_.joinable()) {
-            event_base_loop(base_, 0);
-        } else {
-            bg_.join();
-        }
-    }
-
-    void Wait() {
-        event_del(notify_ev_);
-        if(bg_.joinable()) {
-            if(bg_.get_id() == std::this_thread::get_id()) {
-                bg_.detach();
-                return;
-            }
-            bg_.join();
-        } else {
+        if(!WaitBackground()) {
             event_base_loop(base_, 0);
         }
     }
 
-    void Stop(bool force = false) {
-        if(force) {
-            event_base_loopexit(base_, NULL);
-        } else {
-            event_del(notify_ev_);
-        }
+    void Stop(int64_t ms = 0) {
+        timeval tv;
+        event_base_loopexit(base_, ms ? internal::setTimevalFromMs(tv, ms) : NULL);
     }
 
     void RunInBackground() {
@@ -168,11 +153,13 @@ public:
         }
     }
 
-    class TimerEvent {
+    class Timer {
     public:
-        TimerEvent(EventLoopPtr loop, const TimeoutFunc& func) : loop_(loop), func_(func) {}
+        Timer(EventLoopPtr loop, const TimeoutFunc& func) : loop_(loop), func_(func) {
+            timer_ev_ = event_new(loop_->GetEventBase(), -1, EV_PERSIST, &Timer::Timeout, this);
+        }
 
-        ~TimerEvent() {
+        ~Timer() {
             Stop();
         }
 
@@ -181,35 +168,21 @@ public:
             repeat_ = false;
         }
 
-        void Suspend() {
-            event_del(timer_ev_);
-        }
-
-        void Resume(int64_t ms) {
+        template <typename Duration>
+        void Start(const Duration& duration, bool repeat = false) {
+            static_assert(internal::is_chrono_duration<Duration>::value, "arg0 must be a std::chrono::duration");
             timeval tv;
-            evtimer_add(timer_ev_, internal::setTimevalFromMs(tv, ms));
-            loop_->Interrupt();
-        }
-
-        void Resume() {
-            evtimer_add(timer_ev_, NULL);
-            loop_->Interrupt();
-        }
-
-        void Start(int64_t ms, bool repeat) {
-            if(!timer_ev_) {
-                timer_ev_ = event_new(loop_->GetEventBase(), -1, repeat ? EV_PERSIST : 0, &TimerEvent::Timeout, this);
-            }
-
-            timeval tv;
-            evtimer_add(timer_ev_, internal::setTimevalFromMs(tv, ms));
+            evtimer_add(timer_ev_, internal::setTimevalFromDuration(tv, duration));
             repeat_ = repeat;
             loop_->Interrupt();
         }
 
+        EventLoopPtr GetLoop() {
+            return loop_;
+        }
     private:
         static void Timeout(evutil_socket_t fd, short event, void *arg) {
-            TimerEvent *timer = static_cast<TimerEvent*>(arg);
+            Timer *timer = static_cast<Timer*>(arg);
             timer->func_(timer);
             if(!timer->repeat_) {
                 delete timer;
@@ -231,6 +204,18 @@ private:
         event_add(notify_ev_, nullptr);
     }
 
+    bool WaitBackground() {
+        if(bg_.joinable()) {
+            if(bg_.get_id() == std::this_thread::get_id()) {
+                bg_.detach();
+            } else {
+                bg_.join();
+            }
+            return true;
+        }
+        return false;
+    }
+
     static void Wakeup(evutil_socket_t fd, short event, void *arg) {
         uint64_t dummy;
         dummy = read(fd, &dummy, sizeof(dummy));
@@ -244,7 +229,7 @@ private:
 
 class Response {
 public:
-    struct BodySlice {
+    struct StringSlice {
         char *content;
         size_t length;
 
@@ -262,7 +247,7 @@ public:
         return evhttp_find_header(req_->input_headers, key);
     }
 
-    BodySlice GetBody() {
+    StringSlice GetBody() {
         auto *buf = req_->input_buffer;
         if(buf) {
             return {reinterpret_cast<char*>(evbuffer_pullup(buf, -1)),
