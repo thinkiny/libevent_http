@@ -101,7 +101,7 @@ typedef std::shared_ptr<EventLoop> EventLoopPtr;
 class EventLoop : public std::enable_shared_from_this<EventLoop> {
 public:
     class Timer;
-    typedef std::function<void(Timer*)> TimeoutFunc;
+    typedef std::function<bool()> TimeoutFunc;
     static EventLoopPtr New() {
         EventLoopPtr loop(new EventLoop());
         loop->RunInBackground();
@@ -129,11 +129,11 @@ public:
         dummy = write(notify_fd_, &dummy, sizeof(dummy));
     }
 
-    template <typename Duration>
-    void Cron(const Duration& duration, bool repeat, const TimeoutFunc& func) {
+    template <typename Duration, typename Func>
+    void Cron(const Duration& duration, Func&& func) {
         static_assert(internal::is_chrono_duration<Duration>::value, "arg0 must be a std::chrono::duration");
-        auto *timer = new Timer(shared_from_this(), func);
-        timer->Start(duration, repeat);
+        auto *timer = new Timer(shared_from_this(), std::forward<Func>(func));
+        timer->RunAfter(duration);
     }
 
     void Run() {
@@ -153,10 +153,24 @@ public:
         }
     }
 
+    template <typename Func>
+    Timer* NewTimer(Func&& func) {
+        return new Timer(shared_from_this(), std::forward<Func>(func));
+    };
+
+    Timer* NewTimer() {
+        return new Timer(shared_from_this());
+    };
+
     class Timer {
     public:
-        Timer(EventLoopPtr loop, const TimeoutFunc& func) : loop_(loop), func_(func) {
+        Timer(EventLoopPtr loop) : loop_(loop) {
             timer_ev_ = event_new(loop_->GetEventBase(), -1, EV_PERSIST, &Timer::Timeout, this);
+        }
+
+        template <typename Func>
+        Timer(EventLoopPtr loop, Func&& func) : Timer(loop) {
+            func_ = std::forward<Func>(func);
         }
 
         ~Timer() {
@@ -165,31 +179,33 @@ public:
 
         void Stop() {
             event_del(timer_ev_);
-            repeat_ = false;
         }
 
         template <typename Duration>
-        void Start(const Duration& duration, bool repeat = false) {
+        void RunAfter(const Duration& duration) {
             static_assert(internal::is_chrono_duration<Duration>::value, "arg0 must be a std::chrono::duration");
             timeval tv;
             evtimer_add(timer_ev_, internal::setTimevalFromDuration(tv, duration));
-            repeat_ = repeat;
             loop_->Interrupt();
         }
 
-        EventLoopPtr GetLoop() {
+        template <typename Duration, typename Func>
+        void RunAfter(const Duration& duration, Func&& func) {
+            func_ = std::forward<Func>(func);
+            RunAfter(duration);
+        }
+
+        EventLoopPtr GetEventLoop() {
             return loop_;
         }
     private:
         static void Timeout(evutil_socket_t fd, short event, void *arg) {
             Timer *timer = static_cast<Timer*>(arg);
-            timer->func_(timer);
-            if(!timer->repeat_) {
+            if(!timer->func_()) {
                 delete timer;
             }
         }
 
-        bool repeat_;
         EventLoopPtr loop_;
         internal::Event timer_ev_;
         TimeoutFunc func_;
