@@ -277,14 +277,16 @@ private:
 };
 
 class Get {
+    Get(const Get&) = delete;
+    Get& operator=(const Get&) = delete;
     struct ExecuteContext;
 public:
     typedef std::function<void(Response&&)> FinishFunc;
     typedef std::function<void(const char*)> ErrorFunc;
 public:
-    Get(const Get&) = delete;
-    Get& operator=(const Get&) = delete;
     Get(Get&&) = default;
+    Get& operator=(Get&&) = default;
+
     Get(const std::string& url) : Get(url.c_str()) {}
     Get(const std::string& url, EventLoopPtr& loop) : Get(url.c_str(), loop) {}
     Get(const char *url) {
@@ -297,60 +299,36 @@ public:
         Init(url);
     }
 
-    Get& SetTimeout(int ms) & {
+    Get& SetTimeoutMs(int ms) {
         timeval tv;
         evhttp_connection_set_timeout_tv(conn_, internal::setTimevalFromMs(tv, ms));
         return *this;
     }
 
-    Get&& SetTimeout(int ms) && {
-        return std::move(this->SetTimeout(ms));
-    }
-
-    Get& SetRetryMax(int times) & {
+    Get& SetRetryMax(int times) {
         evhttp_connection_set_retries(conn_, times);
         return *this;
     }
 
-    Get&& SetRetryMax(int times) && {
-        return std::move(this->SetRetryMax(times));
-    }
-
-    Get& AddHeader(const char *key, std::string value) & {
+    Get& AddHeader(const char *key, std::string value) {
         headers_[key] = std::move(value);
         return *this;
     }
 
-    Get&& AddHeader(const char *key, std::string value) && {
-        return std::move(this->AddHeader(key, value));
-    }
-
-    Get& SetRetryInterval(int ms) & {
+    Get& SetRetryIntervalMs(int ms) {
         timeval tv;
         evhttp_connection_set_initial_retry_tv(conn_, internal::setTimevalFromMs(tv, ms));
         return *this;
     }
 
-    Get&& SetRetryInterval(int ms) && {
-        return std::move(this->SetRetryInterval(ms));
-    }
-
-    Get& SetMaxBodySize(ssize_t size) & {
+    Get& SetMaxBodySize(ssize_t size) {
         evhttp_connection_set_max_body_size(conn_, size);
         return *this;
     }
 
-    Get&& SetMaxBodySize(ssize_t size) && {
-        return std::move(this->SetMaxBodySize(size));
-    }
-
-    Get& SetMaxHeaderSize(ssize_t size) & {
+    Get& SetMaxHeaderSize(ssize_t size) {
         evhttp_connection_set_max_body_size(conn_, size);
         return *this;
-    }
-
-    Get&& SetMaxHeaderSize(ssize_t size) && {
-        return std::move(this->SetMaxHeaderSize(size));
     }
 
     template <typename T>
